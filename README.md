@@ -1,5 +1,5 @@
 # ImageCure — Noise Detector & Denoiser
-### Digital Image Processing · Student Project
+### Digital Image Processing · PBL Project
 
 ---
 
