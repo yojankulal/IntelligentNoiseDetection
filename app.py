@@ -359,6 +359,14 @@ def compute_image_stats(gray_img):
 def detect_noise_type(img_bgr):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     s = compute_image_stats(gray)
+    
+    # ───────── CLEAN IMAGE DETECTION ─────────
+    if (
+        s["std"] < 10 and
+        s["laplacian_var"] > 100 and
+        (s["black_pct"] + s["white_pct"]) < 1
+    ):
+        return "Clean Image", 0.95, s, {"Clean Image": 1.0}
 
     # ───────── IMPROVED SALT & PEPPER DETECTION ─────────
 
@@ -430,71 +438,82 @@ def detect_noise_type(img_bgr):
 # ═══════════════════════════════════════════════════════════════
 
 def denoise_salt_and_pepper(img):
-    """
-    Median filter – best for salt & pepper noise.
-    Replaces each pixel with the median of its neighbourhood,
-    effectively removing isolated spikes (salt/pepper pixels).
-    """
-    return cv2.medianBlur(img, 5)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    median = cv2.medianBlur(img, 3)
+
+    # Detect noisy pixels
+    diff = cv2.absdiff(gray, cv2.cvtColor(median, cv2.COLOR_BGR2GRAY))
+    mask = diff > 40   # threshold
+
+    # Replace only noisy pixels
+    result = img.copy()
+    result[mask] = median[mask]
+
+    # Optional sharpening
+    blurred = cv2.GaussianBlur(result, (3, 3), 0)
+    result = cv2.addWeighted(result, 1.4, blurred, -0.4, 0)
+
+    return result
 
 
 def denoise_gaussian(img):
-    """
-    Gaussian blur + Non-Local Means.
-    NLM denoising searches non-local patches for averaging,
-    great for additive Gaussian noise while preserving edges.
-    """
-    # Non-Local Means – h controls filter strength
+    # Step 1: Non-local means (main denoising)
     if len(img.shape) == 3:
-        denoised = cv2.fastNlMeansDenoisingColored(img, None,
-                                                    h=10, hColor=10,
-                                                    templateWindowSize=7,
-                                                    searchWindowSize=21)
+        denoised = cv2.fastNlMeansDenoisingColored(
+            img, None, 10, 10, 7, 21
+        )
     else:
-        denoised = cv2.fastNlMeansDenoising(img, None,
-                                             h=10,
-                                             templateWindowSize=7,
-                                             searchWindowSize=21)
-    return denoised
+        denoised = cv2.fastNlMeansDenoising(img, None, 10, 7, 21)
+
+    # Step 2: Edge restoration
+    blurred = cv2.GaussianBlur(denoised, (3, 3), 0)
+    sharpened = cv2.addWeighted(denoised, 1.4, blurred, -0.4, 0)
+
+    return sharpened
 
 
 def denoise_speckle(img):
-    """
-    Bilateral filter – best for speckle noise.
-    Smooths while preserving edges by weighting by both
-    spatial proximity and intensity similarity.
-    """
-    return cv2.bilateralFilter(img, d=9, sigmaColor=75, sigmaSpace=75)
+    # Step 1: Bilateral filter (edge preserving)
+    denoised = cv2.bilateralFilter(img, d=9, sigmaColor=75, sigmaSpace=75)
+
+    # Step 2: Enhance details
+    blurred = cv2.GaussianBlur(denoised, (3, 3), 0)
+    sharpened = cv2.addWeighted(denoised, 1.5, blurred, -0.5, 0)
+
+    return sharpened
 
 
 def denoise_motion_blur(img):
-    """
-    Wiener-like sharpening via unsharp masking + Gaussian pre-smooth.
-    Motion blur is hard to invert without knowing the blur direction;
-    unsharp masking recovers perceived sharpness.
-    """
-    blurred = cv2.GaussianBlur(img, (5, 5), 0)
-    # Unsharp mask: original + (original – blurred)
-    sharpened = cv2.addWeighted(img, 1.5, blurred, -0.5, 0)
+    # Step 1: Mild smoothing
+    smooth = cv2.GaussianBlur(img, (3, 3), 0)
+
+    # Step 2: Strong unsharp masking
+    sharpened = cv2.addWeighted(img, 1.8, smooth, -0.8, 0)
+
     return np.clip(sharpened, 0, 255).astype(np.uint8)
 
-
 def denoise_poisson(img):
-    """
-    Gaussian filter for Poisson noise.
-    Poisson noise is signal-dependent; a mild Gaussian blur
-    is a practical approximation for low-light / photon-count images.
-    """
-    return cv2.GaussianBlur(img, (5, 5), 1.0)
+    # Step 1: Light Gaussian smoothing
+    denoised = cv2.GaussianBlur(img, (3, 3), 0.8)
+
+    # Step 2: Restore contrast
+    sharpened = cv2.addWeighted(denoised, 1.3, img, -0.3, 0)
+
+    return sharpened
 
 
 def denoise_uniform(img):
-    """
-    Median + Bilateral combo for uniform noise.
-    Median handles outliers; bilateral smooths remaining noise.
-    """
+    # Step 1: Median (small)
     med = cv2.medianBlur(img, 3)
-    return cv2.bilateralFilter(med, d=7, sigmaColor=50, sigmaSpace=50)
+
+    # Step 2: Bilateral (refinement)
+    denoised = cv2.bilateralFilter(med, d=7, sigmaColor=50, sigmaSpace=50)
+
+    # Step 3: Sharpen
+    blurred = cv2.GaussianBlur(denoised, (3, 3), 0)
+    sharpened = cv2.addWeighted(denoised, 1.4, blurred, -0.4, 0)
+
+    return sharpened
 
 
 DENOISER_MAP = {
@@ -526,7 +545,10 @@ NOISE_ICONS = {
 
 
 def auto_denoise(img_bgr, noise_type):
-    """Apply the appropriate denoiser for the detected noise type."""
+    # If image is clean → do NOTHING
+    if noise_type == "Clean Image":
+        return img_bgr
+
     fn = DENOISER_MAP.get(noise_type, denoise_gaussian)
     return fn(img_bgr)
 
@@ -644,6 +666,7 @@ def render_image_card(label, img_bgr, caption=""):
 
 def render_noise_result(noise_type, confidence, scores):
     """Display noise detection result with confidence bar."""
+    
     icon = NOISE_ICONS.get(noise_type, "🔍")
     st.markdown(f"""
     <div class="noise-badge">
@@ -661,6 +684,9 @@ def render_noise_result(noise_type, confidence, scores):
         <div class="conf-bar-fill" style="width:{int(confidence*100)}%"></div>
     </div>
     """, unsafe_allow_html=True)
+    
+    if noise_type == "Clean Image":
+        st.success("✅ Image is already clean. No denoising applied.")
 
     # Show all scores
     with st.expander("🔎 All noise scores", expanded=False):
@@ -727,7 +753,7 @@ def main():
         if use_gamma:
             gamma = st.slider("Gamma", 0.3, 3.0, 1.0, 0.05)
 
-        use_sharp = st.checkbox("🔪 Sharpening", value=False)
+        use_sharp = st.checkbox("🔪 Sharpening", value=True)
         if use_sharp:
             sharp_str = st.slider("Sharpening Strength", 0.1, 3.0, 1.0, 0.1)
 
