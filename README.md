@@ -52,3 +52,28 @@ A smart web application that automatically detects noise in images using a CNN m
 ---
 
 ## 📂 Project Structure
+image-noise-detector/
+│
+├── app.py # Streamlit Web App
+├── train_model.py # CNN Model Training Script
+├── cnn_noise_model.h5 # Trained Model (not included in repo)
+├── dataset/ # Training dataset (not included)
+├── requirements.txt
+└── README.md
+
+
+---
+
+## ⚙️ How to Run Locally
+
+### 1️⃣ Clone the repository
+
+```bash
+git clone https://github.com/YOUR_USERNAME/YOUR_REPO.git
+cd YOUR_REPO
+
+pip install -r requirements.txt
+
+python train_model.py
+
+cnn_noise_model.h5
