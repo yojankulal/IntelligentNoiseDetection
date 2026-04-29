@@ -18,7 +18,10 @@ import cv2
 from PIL import Image
 import io
 import matplotlib.pyplot as plt
+import joblib
+from tensorflow.keras.models import load_model
 
+model = load_model("cnn_noise_model.h5")
 # ─────────────────────────────────────────────
 # Page Configuration
 # ─────────────────────────────────────────────
@@ -357,102 +360,60 @@ def compute_image_stats(gray_img):
 
 
 def detect_noise_type(img_bgr):
+    # Convert to grayscale (for stats)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    s = compute_image_stats(gray)
-    
-    # ───────── CLEAN IMAGE DETECTION ─────────
-    if (
-        s["std"] < 10 and
-        s["laplacian_var"] > 100 and
-        (s["black_pct"] + s["white_pct"]) < 1
-    ):
-        return "Clean Image", 0.95, s, {"Clean Image": 1.0}
 
-    # ───────── IMPROVED SALT & PEPPER DETECTION ─────────
+    # ✅ KEEP stats (important for UI)
+    stats = compute_image_stats(gray)
 
-    # Count extreme pixels
-    extreme_pct = s["black_pct"] + s["white_pct"]
+    # ✅ CNN input preprocessing
+    img_resized = cv2.resize(img_bgr, (128, 128))
+    img_resized = img_resized / 255.0
+    img_input = np.expand_dims(img_resized, axis=0)
 
-    # Detect isolated pixels (true S&P noise)
-    median = cv2.medianBlur(gray, 3)
-    diff = cv2.absdiff(gray, median)
-    isolated_noise = np.mean(diff > 40) * 100  # % of noisy pixels
+    # ✅ Predict using CNN
+    preds = model.predict(img_input)[0]
 
-    # Detect strong local spikes
-    local_diff = cv2.Laplacian(gray, cv2.CV_64F)
-    spike_strength = np.mean(np.abs(local_diff))
+    class_names = ["clean", "gaussian", "salt_pepper", "speckle", "motion_blur"]
 
-    if (
-        extreme_pct > 3 or
-        isolated_noise > 2 or
-        spike_strength > 25
-    ):
-        return "Salt & Pepper", 0.96, s, {"Salt & Pepper": 1.0}
+    pred_class = class_names[np.argmax(preds)]
+    confidence = float(np.max(preds))
 
-    # ───────── MOTION BLUR ─────────
-    if s["laplacian_var"] < 60:
-        return "Motion Blur", 0.9, s, {"Motion Blur": 1.0}
+    # Map to UI labels
+    label_map = {
+        "clean": "Low Noise / Clean",
+        "gaussian": "Gaussian",
+        "salt_pepper": "Salt & Pepper",
+        "speckle": "Speckle",
+        "motion_blur": "Motion Blur"
+    }
 
-    # ───────── SOFT SCORING ─────────
-    scores = {}
+    noise_type = label_map.get(pred_class, "Unknown")
 
-    std_norm  = min(s["std"] / 60.0, 1.0)
-    lap_norm  = min(s["laplacian_var"] / 300.0, 1.0)
-    skew_low  = 1.0 / (1.0 + abs(s["skewness"]))
-    cvlv_norm = min(s["cvlv"] / 3.0, 1.0)
+    # All class scores
+    scores = dict(zip(class_names, preds))
 
-    # Gaussian Noise
-    scores["Gaussian"] = (
-        0.55 * std_norm +
-        0.25 * skew_low +
-        0.20 * lap_norm
-    )
-
-    # Speckle Noise
-    scores["Speckle"] = (
-        0.65 * cvlv_norm +
-        0.20 * std_norm +
-        0.15 * (1 - skew_low)
-    )
-
-    # ───────── PICK BEST ─────────
-    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-    best_type, best_score = sorted_scores[0]
-    second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0
-
-    # ───────── CONFIDENCE CHECK ─────────
-    if best_score < 0.3:
-        return "Low Noise / Clean", 0.6, s, scores
-
-    if (best_score - second_score) < 0.15:
-        return "Uncertain", 0.5, s, scores
-
-    confidence = 0.6 + 0.4 * best_score
-
-    return best_type, round(confidence, 2), s, scores
-
+    # ✅ RETURN EVERYTHING (THIS FIXES YOUR ERROR)
+    return noise_type, round(confidence, 2), stats, scores
 
 # ═══════════════════════════════════════════════════════════════
 # MODULE 2: DENOISING FILTERS
 # ═══════════════════════════════════════════════════════════════
 
 def denoise_salt_and_pepper(img):
+    # Convert to grayscale for mask detection
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    median = cv2.medianBlur(img, 3)
+    
+    # Detect salt & pepper pixels (very dark or very bright)
+    mask = (gray <= 10) | (gray >= 245)
 
-    # Detect noisy pixels
-    diff = cv2.absdiff(gray, cv2.cvtColor(median, cv2.COLOR_BGR2GRAY))
-    mask = diff > 40   # threshold
+    # Apply median filter
+    median = cv2.medianBlur(img, 5)
 
-    # Replace only noisy pixels
+    # Replace ONLY noisy pixels
     result = img.copy()
     result[mask] = median[mask]
-
-    # Optional sharpening
-    blurred = cv2.GaussianBlur(result, (3, 3), 0)
-    result = cv2.addWeighted(result, 1.4, blurred, -0.4, 0)
-
+    
     return result
 
 
@@ -545,8 +506,15 @@ NOISE_ICONS = {
 
 
 def auto_denoise(img_bgr, noise_type):
-    # If image is clean → do NOTHING
-    if noise_type == "Clean Image":
+
+    # 🔥 override if salt-pepper pattern detected
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    extreme_pixels = np.mean((gray <= 10) | (gray >= 245))
+
+    if extreme_pixels > 0.03:   # 3% pixels extreme → salt & pepper
+        return denoise_salt_and_pepper(img_bgr)
+
+    if noise_type in ["Low Noise / Clean", "Uncertain"]:
         return img_bgr
 
     fn = DENOISER_MAP.get(noise_type, denoise_gaussian)
@@ -650,6 +618,49 @@ def image_entropy(gray):
     entropy = -np.sum(hist[hist > 0] * np.log2(hist[hist > 0]))
     return round(float(entropy), 2)
 
+# ─────────────────────────────────────────────
+# IMAGE FORMAT CONVERSIONS
+# ─────────────────────────────────────────────
+
+def convert_to_grayscale(img_bgr):
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    return gray
+
+
+def convert_to_binary(img_bgr):
+    gray = convert_to_grayscale(img_bgr)
+    _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+    return binary
+
+
+def convert_to_hsi(img_bgr):
+    # Convert BGR → RGB
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+    R, G, B = rgb[:,:,0], rgb[:,:,1], rgb[:,:,2]
+
+    # Intensity
+    I = (R + G + B) / 3.0
+
+    # Saturation
+    min_rgb = np.minimum(np.minimum(R, G), B)
+    S = 1 - (3 / (R + G + B + 1e-6)) * min_rgb
+
+    # Hue
+    num = 0.5 * ((R - G) + (R - B))
+    den = np.sqrt((R - G)**2 + (R - B)*(G - B)) + 1e-6
+    theta = np.arccos(num / den)
+
+    H = np.where(B <= G, theta, 2*np.pi - theta)
+    H = H / (2*np.pi)
+
+    # Stack HSI
+    hsi = np.stack((H, S, I), axis=-1)
+
+    # Scale to 0–255 for display
+    hsi = (hsi * 255).astype(np.uint8)
+
+    return hsi
 
 # ═══════════════════════════════════════════════════════════════
 # MODULE 5: UI RENDERING HELPERS
@@ -732,8 +743,8 @@ def main():
         st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
 
         st.markdown("**Input Source**")
-        input_mode = st.radio("", ["📁 Upload Image", "📷 Camera Capture"],
-                               label_visibility="collapsed")
+        input_mode = st.radio("Select Input", ["📁 Upload Image", "📷 Camera Capture"],
+                       label_visibility="collapsed")
 
         st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
 
@@ -753,9 +764,15 @@ def main():
         if use_gamma:
             gamma = st.slider("Gamma", 0.3, 3.0, 1.0, 0.05)
 
-        use_sharp = st.checkbox("🔪 Sharpening", value=True)
+        use_sharp = st.checkbox("🔪 Sharpening", value=False)
         if use_sharp:
             sharp_str = st.slider("Sharpening Strength", 0.1, 3.0, 1.0, 0.1)
+        st.markdown("**Output Format Conversion**")
+
+        convert_option = st.selectbox(
+            "Convert Final Image To:",
+            ["None", "Grayscale", "Binary", "HSI"]
+        )
 
         st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
         st.markdown("""
@@ -850,10 +867,23 @@ def main():
     st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
 
     with st.spinner(f"✨ Applying {noise_type} denoiser…"):
-        denoised_bgr = auto_denoise(img_bgr, noise_type)
+        if noise_type in ["Low Noise / Clean", "Uncertain"]:
+            denoised_bgr = img_bgr.copy()   # 🚀 keep original (no blur)
+        else:
+           denoised_bgr = auto_denoise(img_bgr, noise_type)
 
     # ── Step 4: Enhancement ──────────────────────────────────
     enhanced_bgr = denoised_bgr.copy()
+    converted_img = None
+
+    if convert_option == "Grayscale":
+        converted_img = convert_to_grayscale(enhanced_bgr)
+
+    elif convert_option == "Binary":
+        converted_img = convert_to_binary(enhanced_bgr)
+
+    elif convert_option == "HSI":
+        converted_img = convert_to_hsi(enhanced_bgr)
 
     if use_clahe:
         enhanced_bgr = apply_clahe(enhanced_bgr, clip_limit=clahe_clip)
@@ -861,8 +891,20 @@ def main():
         enhanced_bgr = apply_contrast(enhanced_bgr, alpha=alpha, beta=beta)
     if use_gamma:
         enhanced_bgr = apply_gamma(enhanced_bgr, gamma=gamma)
-    if use_sharp:
+    if use_sharp and noise_type != "Salt & Pepper":
         enhanced_bgr = apply_sharpening(enhanced_bgr, strength=sharp_str)
+    
+    converted_img = None
+
+    if convert_option == "Grayscale":
+        converted_img = convert_to_grayscale(enhanced_bgr)
+
+    elif convert_option == "Binary":
+        converted_img = convert_to_binary(enhanced_bgr)
+
+    elif convert_option == "HSI":
+        converted_img = convert_to_hsi(enhanced_bgr)
+
 
     # ── Display Results ──────────────────────────────────────
     col3, col4 = st.columns(2, gap="large")
@@ -912,6 +954,33 @@ def main():
             mime="image/png",
             use_container_width=True,
         )
+        
+        # ✅ ===== CONVERTED IMAGE DISPLAY =====
+        if converted_img is not None:
+            st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-label">🔄 CONVERTED IMAGE</div>', unsafe_allow_html=True)
+
+            if convert_option in ["Grayscale", "Binary"]:
+                st.image(converted_img, clamp=True, use_container_width=True)
+            else:
+                st.image(converted_img, use_container_width=True)
+
+            # ✅ ===== DOWNLOAD CONVERTED IMAGE =====
+            if len(converted_img.shape) == 2:
+                pil_conv = Image.fromarray(converted_img)
+            else:
+                pil_conv = Image.fromarray(converted_img)
+
+            conv_bytes = img_to_download_bytes(pil_conv, "PNG")
+
+            st.download_button(
+                label=f"⬇️ Download {convert_option} Image",
+                data=conv_bytes,
+                file_name=f"converted_{convert_option.lower()}.png",
+                mime="image/png",
+                use_container_width=True,
+            )
+
 
     # ── Histogram Comparison ─────────────────────────────────
     st.markdown('<div class="custom-divider"></div>', unsafe_allow_html=True)
